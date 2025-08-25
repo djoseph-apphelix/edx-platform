@@ -1782,25 +1782,25 @@ class CourseLinkUpdateTask(UserTask):  # pylint: disable=abstract-method
         Returns:
             str: The generated name
         """
-        key = arguments_dict["course_key_string"]
+        key = arguments_dict["course_id"]
         return f"Course link update of {key}"
 
 
 @shared_task(base=CourseLinkUpdateTask, bind=True)
 def update_course_rerun_links(
-    self, user_id, course_key_string, action, data=None, language=None
+    self, user_id, course_id, action, data=None, language=None
 ):
     """
     Updates course links to point to the latest re-run.
     """
     set_code_owner_attribute_from_module(__name__)
     return _update_course_rerun_links(
-        self, user_id, course_key_string, action, data, language
+        self, user_id, course_id, action, data, language
     )
 
 
 def _update_course_rerun_links(
-    task_instance, user_id, course_key_string, action, data, language
+    task_instance, user_id, course_id, action, data, language
 ):
     """
     Updates course links to point to the latest re-run.
@@ -1808,9 +1808,9 @@ def _update_course_rerun_links(
     Args:
         task_instance: The Celery task instance
         user_id: ID of the user requesting the update
-        course_key_string: String representation of the course key
-        action: 'all' or 'specific'
-        data: List of specific links to update (when action='specific')
+        course_id: String representation of the course key
+        action: 'all' or 'single'
+        data: List of specific links to update (when action='single')
         language: Language code for translations
     """
     user = _validate_user(task_instance, user_id, language)
@@ -1818,9 +1818,8 @@ def _update_course_rerun_links(
         return
 
     task_instance.status.set_state(UserTaskStatus.IN_PROGRESS)
-    course_key = CourseKey.from_string(course_key_string)
+    course_key = CourseKey.from_string(course_id)
     prev_run_course_key = get_previous_run_course_key(course_key)
-
     try:
         task_instance.status.set_state("Scanning")
 
@@ -1839,7 +1838,7 @@ def _update_course_rerun_links(
                         }
                     )
         else:
-            # Process only specific course link updates
+            # Process only single link updates
             links_to_update = data or []
 
         task_instance.status.increment_completed_steps()
@@ -1854,6 +1853,7 @@ def _update_course_rerun_links(
                 )
                 updated_links.append(
                     {
+                        "original_url": link_data.get("url", ""),
                         "new_url": new_url,
                         "type": link_data.get("type", "unknown"),
                         "id": link_data.get("id", ""),
@@ -1866,6 +1866,7 @@ def _update_course_rerun_links(
                 )
                 updated_links.append(
                     {
+                        "original_url": link_data.get("url", ""),
                         "new_url": link_data.get("url", ""),
                         "type": link_data.get("type", "unknown"),
                         "id": link_data.get("id", ""),
@@ -1889,6 +1890,9 @@ def _update_course_rerun_links(
             name=os.path.basename(results_file.name), content=File(results_file)
         )
         artifact.save()
+
+        # Update the existing broken links file to reflect the updated links
+        _update_broken_links_file_with_updated_links(course_key, updated_links)
 
         task_instance.status.succeed()
 
@@ -2092,7 +2096,6 @@ def _update_course_content_link(block_id, old_url, new_url, course_key, user):
     try:
         usage_key = UsageKey.from_string(block_id)
         block = store.get_item(usage_key)
-
         if hasattr(block, "data") and old_url in block.data:
             block.data = block.data.replace(old_url, new_url)
             store.update_item(block, user.id)
@@ -2125,3 +2128,105 @@ def _update_block_content_with_new_url(block_id, old_url, new_url, link_type, co
         _update_custom_pages_link(block_id, old_url, new_url, course_key, user)
     else:
         _update_course_content_link(block_id, old_url, new_url, course_key, user)
+
+
+def _update_broken_links_file_with_updated_links(course_key, updated_links):
+    """
+    Updates the existing broken links file to reflect the status of updated links.
+
+    This function finds the latest broken links file for the course and updates it
+    to remove successfully updated links or update their status.
+
+    Args:
+        course_key: The current course key
+        updated_links: List of updated link results from the link update task
+    """
+    try:
+        # Find the latest broken links task artifact for this course
+        latest_artifact = UserTaskArtifact.objects.filter(
+            name="BrokenLinks", status__name__contains=str(course_key)
+        ).order_by("-created").first()
+
+        if not latest_artifact or not latest_artifact.file:
+            LOGGER.debug(f"No broken links file found for course {course_key}")
+            return
+
+        # Read the existing broken links file
+        try:
+            with latest_artifact.file.open("r") as file:
+                existing_broken_links = json.load(file)
+        except (json.JSONDecodeError, IOError) as e:
+            LOGGER.error(
+                f"Failed to read broken links file for course {course_key}: {e}"
+            )
+            return
+
+        # Create a mapping of successfully updated links
+        updated_urls_map = {}
+        for result in updated_links:
+            if result.get("success"):
+                original_url = _get_original_url_from_updated_result(result, course_key)
+                if original_url:
+                    updated_urls_map[original_url] = result["new_url"]
+
+        # Update the broken links data
+        updated_broken_links = []
+        for link in existing_broken_links:
+            if len(link) >= 3:
+                block_id, url, link_state = link[0], link[1], link[2]
+
+                if url in updated_urls_map:
+                    new_url = updated_urls_map[url]
+                    updated_broken_links.append([block_id, new_url, link_state])
+                    LOGGER.debug(f"Updated link: {url} -> {new_url}")
+                else:
+                    updated_broken_links.append(link)
+            else:
+                updated_broken_links.append(link)
+
+        # Create a new temporary file with updated data
+        file_name = f"{course_key}_updated"
+        updated_file = NamedTemporaryFile(prefix=file_name + ".", suffix=".json")
+
+        with open(updated_file.name, "w") as file:
+            json.dump(updated_broken_links, file, indent=4)
+
+        # Update the existing artifact with the new file
+        latest_artifact.file.save(
+            name=os.path.basename(updated_file.name), content=File(updated_file)
+        )
+        latest_artifact.save()
+
+        LOGGER.info(f"Successfully updated broken links file for course {course_key}")
+
+    except Exception as e:  # pylint: disable=broad-except
+        LOGGER.error(f"Failed to update broken links file for course {course_key}: {e}")
+
+
+def _get_original_url_from_updated_result(update_result, course_key):
+    """
+    Reconstruct the original URL from an update result.
+
+    Args:
+        update_result: The update result containing new_url and other info
+        course_key: The current course key
+
+    Returns:
+        str: The original URL before update, or None if it cannot be determined
+    """
+    try:
+        new_url = update_result.get("new_url", "")
+        if not new_url or str(course_key) not in new_url:
+            return None
+
+        prev_run_course_key = get_previous_run_course_key(course_key)
+        if not prev_run_course_key:
+            return None
+
+        return new_url.replace(str(course_key), str(prev_run_course_key))
+
+    except Exception as e:  # pylint: disable=broad-except
+        LOGGER.debug(
+            f"Failed to reconstruct original URL from update result: {e}"
+        )
+        return None
